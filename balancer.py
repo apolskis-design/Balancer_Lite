@@ -17,6 +17,209 @@ DATA_FILE = 'balancer_data.json'
 RESOLUTION_CACHE_FILE = 'resolution_cache.json'
 DEFAULT_PROFILE_NAME = 'Default'
 
+# ======================================================================
+# MINER COMPATIBILITY — shared vocabulary with Miner.py
+# ----------------------------------------------------------------------
+# Miner.py is the AUTHORITY over balancer_data.json: it moves files on
+# disk, swaps dataset slots, groups images, and above all it can turn a
+# dataset slot into a VACANCY — an empty ("") entry that keeps its
+# position in the list while vacant_slots records what used to sit there.
+#
+# Balancer must speak exactly the same language or the two apps disagree
+# about what "selected" means (Miner shows every slot it renders,
+# including vacancies; balancer used to filter the dataset against a raw
+# exact-string disk scan, silently dropping vacancy tokens, differently
+# spelled paths, and even DELETING them from the file on save).
+#
+# These helpers mirror Miner.py's canon_path / VACANT_TOKEN /
+# vacant_slots bookkeeping 1:1 so both programs count the same thing.
+# ======================================================================
+VACANT_TOKEN = ''  # what a vacant slot holds in the dataset list (Miner parity)
+
+_CANON_CACHE = {}
+
+
+def canon_path(path):
+    """Canonical form of a filesystem path for identity comparisons.
+
+    Mirrors Miner.py's canon_path EXACTLY (same normalisation, same memo
+    cache semantics) so the two programs always agree on whether two
+    spellings point at the same file.  Qt may hand out ``C:/dir/img.jpg``
+    where balancer stored ``C:\\dir\\img.jpg`` or a relative/8.3/junction
+    form — exact string matching then fails and Miner's entries look
+    "missing" to balancer's counters.  Never raises on missing files.
+    """
+    if not path:
+        return ""
+    key = str(path)
+    cached = _CANON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        p = os.path.normcase(os.path.realpath(os.path.abspath(os.path.normpath(key))))
+    except Exception:
+        p = key
+    _CANON_CACHE[key] = p
+    return p
+
+
+def is_vacancy(slot_value):
+    """True when a dataset slot value is Miner's vacancy token.
+
+    Vacancies are EMPTY strings by definition (VACANT_TOKEN == '').  Any
+    non-empty string is a real image path, even if the file currently
+    looks missing on disk — Miner deliberately keeps such slots in place.
+    """
+    return not slot_value
+
+
+class _ProfileDataProxy:
+    """Read-only view of ONE profile's vacancy bookkeeping.
+
+    Miner.py reaches balancer state through its own BalancerData facade
+    (``balancer.data['vacant_slots'][profile][category][str(index)]``,
+    ``balancer.get_dataset(profile)``, ``balancer.get_vacancy(...)`` …).
+    When Miner imports this module and hands ITSELF to a BalancerApp
+    running in the same process, we expose exactly those attributes from
+    the live app so both tools operate on ONE shared state — no split
+    brain, no diverging counts.
+    """
+
+    def __init__(self, app, profile):
+        self._app = app
+        self._profile = profile
+
+    def get(self, key, default=None):
+        cat = self._app._vacant_slots.get(key)
+        return cat if cat is not None else default
+
+    def __getitem__(self, key):
+        return self._app._vacant_slots[key]
+
+    def __contains__(self, key):
+        return key in self._app._vacant_slots
+
+    def keys(self):
+        return self._app._vacant_slots.keys()
+
+    def items(self):
+        return self._app._vacant_slots.items()
+
+    def values(self):
+        return self._app._vacant_slots.values()
+
+    def __repr__(self):
+        return repr(dict(self._app._vacant_slots))
+
+
+class _VacantSlotsProxy:
+    """Read-only mapping shaped like Miner's top-level ``vacant_slots``
+    dict: ``proxy[profile_name] -> {category: {str(index): info}}``.
+
+    Queries for the CURRENT profile always succeed (the live structure is
+    returned), other profiles resolve against the per-profile snapshots
+    kept in ``profiles[name]['vacant_slots']``.  Mutations are rejected
+    loudly — everything must go through the app's vacancy API so Miner's
+    records can never be corrupted by accident.
+    """
+
+    def __init__(self, app):
+        self._app = app
+
+    def _prof_dict(self, name):
+        if name == self._app.current_profile_name:
+            return _ProfileDataProxy(self._app, name)
+        return self._app.profiles.get(name, {}).get('vacant_slots', {})
+
+    def get(self, key, default=None):
+        if key == self._app.current_profile_name:
+            return _ProfileDataProxy(self._app, key)
+        prof = self._app.profiles.get(key)
+        if not isinstance(prof, dict):
+            return default
+        v = prof.get('vacant_slots')
+        return v if isinstance(v, dict) else default
+
+    def __getitem__(self, key):
+        d = self._prof_dict(key)
+        if key != self._app.current_profile_name and not d:
+            raise KeyError(key)
+        return d
+
+    def __contains__(self, key):
+        if key == self._app.current_profile_name:
+            return True
+        prof = self._app.profiles.get(key)
+        return isinstance(prof, dict) and bool(prof.get('vacant_slots'))
+
+    def keys(self):
+        names = [n for n, p in self._app.profiles.items()
+                 if isinstance(p, dict) and p.get('vacant_slots')]
+        if self._app._vacant_slots:
+            names.append(self._app.current_profile_name)
+        return set(names)
+
+    def items(self):
+        for name in self.keys():
+            yield name, self.get(name, {})
+
+    def values(self):
+        for name, v in self.items():
+            yield v
+
+    def __setitem__(self, key, value):
+        raise TypeError("vacant_slots is managed by BalancerApp "
+                        "(use set_vacancy / clear_vacancy)")
+
+    def __repr__(self):
+        return repr({n: self.get(n, {}) for n in self.keys()})
+
+
+class _ExclusionsProxy:
+    """Read-only view of ``rated_pool_exclusions`` shaped like Miner's
+    top-level dict: ``proxy[profile_name] -> [paths]``.  The current
+    profile resolves to the live list; others read the persisted
+    snapshot stored inside their profile dict."""
+
+    def __init__(self, app):
+        self._app = app
+
+    def get(self, key, default=None):
+        if key == self._app.current_profile_name:
+            return self._app.rated_pool_exclusions
+        prof = self._app.profiles.get(key)
+        if not isinstance(prof, dict):
+            return default
+        v = prof.get('rated_pool_exclusions')
+        return v if isinstance(v, list) else default
+
+    def __getitem__(self, key):
+        return self.get(key, [])
+
+    def __contains__(self, key):
+        return bool(self.get(key))
+
+    def keys(self):
+        names = [n for n, p in self._app.profiles.items()
+                 if isinstance(p, dict) and p.get('rated_pool_exclusions')]
+        if self._app.rated_pool_exclusions:
+            names.append(self._app.current_profile_name)
+        return set(names)
+
+    def items(self):
+        for name in self.keys():
+            yield name, self.get(name, [])
+
+    def values(self):
+        for _, v in self.items():
+            yield v
+
+    def __setitem__(self, key, value):
+        raise TypeError("rated_pool_exclusions is managed by BalancerApp")
+
+    def __repr__(self):
+        return repr({n: self.get(n, []) for n in self.keys()})
+
 # Coarse-grained elimination
 MIN_TOTAL_PIXELS = 720 * 1280
 SCAN_WORKERS = 8

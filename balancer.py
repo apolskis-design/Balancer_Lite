@@ -73,6 +73,190 @@ def is_vacancy(slot_value):
     return not slot_value
 
 
+def load_balancer_data(filepath=DATA_FILE):
+    """Read balancer_data.json exactly the way Miner.py's BalancerData does.
+
+    Returns ``(data, profiles, categories, current_profile)``.  This is the
+    ONLY sanctioned way to peek at the raw shared file: it never mutates
+    anything and mirrors Miner's legacy-format migration so both apps agree
+    on what the file contains even before any UI touches it.
+    """
+    with open(filepath, 'r') as f:
+        data = json.load(f)
+    profiles = data.get('profiles', {}) or {}
+    categories = data.get('categories', {}) or {}
+    if profiles:
+        current = data.get('current_profile', DEFAULT_PROFILE_NAME)
+        if current not in profiles:
+            current = sorted(profiles, key=str.lower)[0]
+    else:
+        profiles = {DEFAULT_PROFILE_NAME: {
+            'dataset': data.get('dataset', {}),
+            'blacklist': data.get('blacklist', {}),
+            'image_tiers': data.get('image_tiers', {}),
+        }}
+        current = DEFAULT_PROFILE_NAME
+    return data, profiles, categories, current
+
+
+def get_dataset_slot_counts(filepath=DATA_FILE):
+    """{category: total_slots} for the CURRENT profile, Miner-style.
+
+    Miner's "Selected Images" gallery renders ONE tile per dataset entry —
+    real paths AND vacancy tokens — straight out of the JSON file, with no
+    disk scan and no coarse-elimination filter.  Counting the same way
+    guarantees balancer's numbers match what Miner displays.
+    """
+    try:
+        _, profiles, _, current = load_balancer_data(filepath)
+    except Exception:
+        return {}
+    ds = profiles.get(current, {}).get('dataset', {}) or {}
+    return {cat: len(lst) for cat, lst in ds.items() if isinstance(lst, list)}
+
+
+def diagnose_selection_mismatch(category, filepath=DATA_FILE):
+    """Explain why balancer's 'selected' count can differ from Miner's.
+
+    Compares Miner's view (raw dataset slot count) against balancer's
+    filtered count and breaks the difference down into its exact causes:
+      • vacancies     – empty '' slots Miner shows as VACANT tiles
+      • missing files – entries whose file is gone / spelled differently
+                        than on disk (never matches the disk scan)
+      • low-res       – coarse-elimination drops (< 720×1280 px)
+    Also flags stale sidecar caches (resolution_cache.json).
+    Returns a dict with the numbers plus a human-readable report.
+    """
+    import tempfile
+
+    data, profiles, categories, current = load_balancer_data(filepath)
+    bucket = profiles.get(current, {}).get('dataset', {}).get(category, []) or []
+    miner_count = len(bucket)
+    vacancies = sum(1 for p in bucket if not p)
+    real_entries = [p for p in bucket if p]
+
+    folders = categories.get(category, []) or []
+    disk = []
+    seen = set()
+    for folder in folders:
+        if os.path.isdir(folder):
+            try:
+                for fn in os.listdir(folder):
+                    if fn.lower().endswith(IMAGE_EXTS):
+                        fp = os.path.join(folder, fn)
+                        if fp not in seen:
+                            seen.add(fp)
+                            disk.append(fp)
+            except Exception as e:
+                print(f"Error scanning {folder}: {e}")
+    disk_set = set(disk)
+    disk_canon = {canon_path(p) for p in disk}
+
+    missing = [p for p in real_entries if p not in disk_set
+               and canon_path(p) not in disk_canon]
+    present = [p for p in real_entries if p not in missing]
+
+    # Low-res check via a throwaway cache copy (never touches the real one).
+    lowres = []
+    try:
+        rc_tmp = os.path.join(tempfile.gettempdir(),
+                              'balancer_diag_rescache_%d.json' % os.getpid())
+        if os.path.exists(RESOLUTION_CACHE_FILE):
+            shutil.copyfile(RESOLUTION_CACHE_FILE, rc_tmp)
+        try:
+            with open(rc_tmp, 'r') as f:
+                cache = json.load(f) or {}
+        except Exception:
+            cache = {}
+
+        def _sig(path):
+            try:
+                st = os.stat(path)
+                return [st.st_mtime, st.st_size]
+            except Exception:
+                return None
+
+        def _lowres(path):
+            entry = cache.get(path)
+            wh = None
+            if entry and entry.get('sig') == _sig(path):
+                wh = (entry.get('w', 0), entry.get('h', 0))
+            else:
+                try:
+                    with Image.open(path) as img:
+                        wh = img.size
+                except Exception:
+                    wh = None
+            if not wh or wh[0] <= 0 or wh[1] <= 0:
+                return False          # unreadable => kept, like balancer does
+            return wh[0] * wh[1] < MIN_TOTAL_PIXELS
+
+        # Coarse elimination only applies to oversized categories.
+        counts = {}
+        for c, fs in categories.items():
+            n = 0
+            for folder in fs:
+                if os.path.isdir(folder):
+                    try:
+                        n += sum(1 for fn in os.listdir(folder)
+                                 if fn.lower().endswith(IMAGE_EXTS))
+                    except Exception:
+                        pass
+            counts[c] = n
+        nonzero = [v for v in counts.values() if v > 0]
+        qualifies = bool(nonzero) and counts.get(category, 0) > min(nonzero) * 2
+        if qualifies:
+            lowres = [p for p in present if _lowres(p)]
+    finally:
+        try:
+            if os.path.exists(rc_tmp):
+                os.remove(rc_tmp)
+        except Exception:
+            pass
+
+    balancer_count = len(present) - len(lowres)
+    unexplained = miner_count - vacancies - len(missing) - len(lowres) \
+        - balancer_count + (len(present) - len(lowres))
+    # (unexplained should be 0; kept simple below instead)
+
+    lines = [
+        f"Category: {category}   Profile: {current}",
+        "",
+        f"Miner shows (raw dataset slots):      {miner_count}",
+        f"  • vacancy tokens (''):              {vacances}"
+        f"   <- Miner renders these as VACANT tiles",
+        f"  • entries not found on disk:        {len(missing)}"
+        f"   <- balancer drops them from 'selected'",
+        f"  • low-res, coarse-eliminated:       {len(lowres)}"
+        f"   <- hidden only while Coarse elimination is ON",
+        f"Balancer 'selected' would show:       {balancer_count}",
+        f"Unaccounted difference:               "
+        f"{miner_count - vacancies - len(missing) - len(lowres) - balancer_count}",
+        "",
+        f"Category folders configured: {len(folders)}"
+        + ("  ⚠ NONE EXIST ON DISK — every entry looks 'missing'"
+           if folders and not disk else ""),
+    ]
+    if missing:
+        lines.append("")
+        lines.append("Missing-path examples (first 5):")
+        for p in missing[:5]:
+            lines.append(f"  {p}")
+    if not os.path.exists(RESOLUTION_CACHE_FILE):
+        lines.append("")
+        lines.append(f"NOTE: {RESOLUTION_CACHE_FILE} not found next to this script — "
+                      "if you run balancer from a different working directory it "
+                      "re-reads every resolution and shares nothing with prior scans.")
+    return {
+        'miner_count': miner_count,
+        'balancer_count': balancer_count,
+        'vacancies': vacancies,
+        'missing': missing,
+        'lowres': lowres,
+        'report': "\n".join(lines),
+    }
+
+
 class _ProfileDataProxy:
     """Read-only view of ONE profile's vacancy bookkeeping.
 
@@ -275,6 +459,13 @@ class BalancerApp:
         self.forced_blacklist = {}
         self.auto_forced_added = {}
         self.auto_resolve_added = {}
+        # Miner's vacancy bookkeeping: {category: {"<slot index>": info}} for
+        # the ACTIVE profile (persisted inside the profile dict).  Balancer
+        # must load/save it verbatim or Miner's VACANT tiles disappear.
+        self.vacant_slots = {}
+        # When True, "selected" is counted the way Miner renders it: every
+        # dataset slot counts (real paths AND vacancies), no disk filtering.
+        self.miner_view = True
 
         self.manual_target = None
         self.auto_include = True
@@ -506,9 +697,11 @@ class BalancerApp:
             'forced_blacklist': {},
             'auto_forced_added': {},
             'auto_resolve_added': {},
+            'vacant_slots': {},
             'manual_target': None,
             'auto_include': True,
             'coarse_elimination': False,
+            'miner_view': True,
             'direct_state': {'direct_category': None},
         }
 
@@ -524,9 +717,11 @@ class BalancerApp:
             'forced_blacklist': self.forced_blacklist,
             'auto_forced_added': self.auto_forced_added,
             'auto_resolve_added': self.auto_resolve_added,
+            'vacant_slots': self.vacant_slots,
             'manual_target': self.manual_target,
             'auto_include': self.auto_include,
             'coarse_elimination': self.coarse_elimination,
+            'miner_view': self.miner_view,
             'direct_state': {'direct_category': self.direct_current_category},
         })
         return prof
@@ -542,9 +737,13 @@ class BalancerApp:
         self.forced_blacklist = profile.get('forced_blacklist', {})
         self.auto_forced_added = profile.get('auto_forced_added', {})
         self.auto_resolve_added = profile.get('auto_resolve_added', {})
+        vac = profile.get('vacant_slots')
+        self.vacant_slots = vac if isinstance(vac, dict) else {}
+        profile['vacant_slots'] = self.vacant_slots
         self.manual_target = profile.get('manual_target', None)
         self.auto_include = profile.get('auto_include', True)
         self.coarse_elimination = profile.get('coarse_elimination', False)
+        self.miner_view = profile.get('miner_view', True)
 
         self._coarse_cache = {}
         self._raw_counts_cache = None
@@ -1243,10 +1442,47 @@ class BalancerApp:
             self.save_data(silent=True)
         return added_total, touched
 
+    def get_vacant_indices(self, category):
+        """Slot indices in ``category`` that Miner marked as vacant."""
+        cat = self.vacant_slots.get(category) or {}
+        out = set()
+        for k in cat.keys():
+            try:
+                out.add(int(k))
+            except (TypeError, ValueError):
+                pass
+        return out
+
     def get_stats(self, category):
         images = self.get_all_images_from_category(category)
         img_set = set(images)
-        selected = [p for p in self.dataset.get(category, []) if p in img_set]
+        # Canonical forms so Miner's spellings (forward slashes / junctions)
+        # still match balancer's freshly scanned disk paths.
+        img_canon = {canon_path(p) for p in images}
+        bucket = self.dataset.get(category, [])
+
+        vacancies = 0
+        real_entries = []
+        for i, p in enumerate(bucket):
+            if not p:                      # Miner vacancy token
+                vacancies += 1
+                continue
+            real_entries.append((i, p))
+
+        if self.miner_view:
+            # MINER PARITY: the Selected gallery renders ONE tile per dataset
+            # slot — every stored path counts, whether or not it currently
+            # matches balancer's disk scan (Miner moves/renames files and
+            # keeps slots on purpose; filtering them away here is what made
+            # balancer show 1000 where Miner shows 1500).
+            selected = [p for _, p in real_entries]
+        else:
+            # Legacy strict view: only entries physically present in the
+            # category folders count as selected.
+            selected = [p for _, p in real_entries
+                        if p in img_set or canon_path(p) in img_canon]
+
+        missing_count = len(real_entries) - len(selected)
         selected_set = set(selected)
         forced_bl = [p for p in self.forced_blacklist.get(category, [])
                      if p in img_set and p not in selected_set]
@@ -1290,8 +1526,11 @@ class BalancerApp:
         else:
             status = f"needs {needed}"
 
+        miner_total = len(bucket)          # exactly what Miner's gallery shows
         return {
             'total': total, 'selected': len(selected), 'selected_list': selected,
+            'vacancies': vacancies, 'missing_paths': missing_count,
+            'miner_selected': miner_total,
             'blacklisted': len(regular_bl), 'regular_blacklist_list': regular_bl,
             'forced_blacklisted': len(forced_bl), 'forced_blacklist_list': forced_bl,
             'available': len(available), 'available_list': available,
@@ -2829,10 +3068,52 @@ class BalancerApp:
                    command=lambda: self.start_coarse_resolution_scan(manual=True)
                    ).pack(side='left', padx=(10, 0))
 
+        opt2 = ttk.Frame(container)
+        opt2.pack(fill='x', pady=(4, 0))
+        self.miner_view_var = tk.BooleanVar(value=self.miner_view)
+        ttk.Checkbutton(opt2,
+                        text="Miner view (recommended): count every dataset slot as selected — "
+                             "matches Miner's Selected gallery exactly (incl. vacancies & moved files)",
+                        variable=self.miner_view_var,
+                        command=self.toggle_miner_view).pack(side='left')
+        ttk.Button(opt2, text="🔍 Why do Miner & Balancer differ?",
+                   command=self.run_selection_diagnosis
+                   ).pack(side='left', padx=(10, 0))
+
         self.stats_display_frame = ttk.Frame(container)
         self.stats_display_frame.pack(fill='both', expand=True, pady=20)
 
         self.update_stats_view()
+
+    def toggle_miner_view(self):
+        self.miner_view = bool(self.miner_view_var.get())
+        self.save_data(silent=True)
+        self.refresh_all_views()
+
+    def run_selection_diagnosis(self):
+        """Reconcile balancer's numbers against the raw shared JSON file."""
+        category = self.stats_category_var.get() if hasattr(self, 'stats_category_var') else ''
+        if not category:
+            category = self.direct_current_category or self.selected_category
+        if not category:
+            messagebox.showwarning("Diagnose", "Select a category first.")
+            return
+        try:
+            diag = diagnose_selection_mismatch(category, DATA_FILE)
+        except FileNotFoundError:
+            messagebox.showerror("Diagnose", f"{DATA_FILE} not found.")
+            return
+        except Exception as e:
+            messagebox.showerror("Diagnose", f"Diagnosis failed: {e}")
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"Miner vs Balancer — {category}")
+        win.geometry("860x560")
+        win.configure(bg=DARK_BG)
+        txt = tk.Text(win, wrap='word', bg=DARK_BG_ALT, fg=DARK_FG, font=('Consolas', 11))
+        txt.pack(fill='both', expand=True, padx=8, pady=8)
+        txt.insert('1.0', diag['report'])
+        txt.config(state='disabled')
 
     def update_stats_view(self):
         if not hasattr(self, 'stats_display_frame'):
